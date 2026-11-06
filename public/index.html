@@ -2,10 +2,200 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
-  <title>Boutique — Suivi de commandes</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Boutique — Suivi des commandes</title>
+  <style>
+    body { max-width: 700px; margin: 2rem auto; padding: 0 1rem; font-family: Arial, sans-serif; }
+    section, article { margin: 1rem 0; padding: .5rem; border: 1px solid #ccc; }
+    label { margin-right: .5rem; }
+    .error { color: #a00; }
+    [hidden] { display: none; }
+  </style>
 </head>
 <body>
   <h1>Boutique en ligne</h1>
-  <p>Projet en construction.</p>
+  <p id="message" role="status"></p>
+
+  <main id="shop">
+    <section>
+      <h2>Créer une commande</h2>
+      <form id="create-order">
+        <label>Client <select id="user" required></select></label>
+        <label>Produit <select id="product" required></select></label>
+        <label>Quantité <input id="quantity" type="number" min="1" value="1" required /></label>
+        <button type="submit">Commander</button>
+      </form>
+    </section>
+    <section>
+      <h2>Produits en stock</h2>
+      <ul id="products"></ul>
+    </section>
+    <section>
+      <h2>Commandes</h2>
+      <div id="orders"></div>
+    </section>
+  </main>
+
+  <main id="tracking" hidden>
+    <p><a href="/">← Retour à la boutique</a></p>
+    <section>
+      <h2>Suivi de la commande <span id="order-id"></span></h2>
+      <p>Statut : <strong id="order-status">Chargement…</strong></p>
+      <p id="tracking-error" class="error"></p>
+    </section>
+  </main>
+
+  <script>
+    const statusLabels = {
+      preparing: "En préparation",
+      shipped: "Expédiée",
+      delivered: "Livrée",
+      cancelled: "Annulée",
+    };
+    const message = document.querySelector("#message");
+
+    async function api(path, options) {
+      const response = await fetch(path, options);
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || "Erreur de requête");
+      return body;
+    }
+
+    function showError(error) {
+      message.textContent = error.message;
+      message.className = "error";
+    }
+
+    async function loadShop() {
+      const [users, products, orders] = await Promise.all([
+        api("/api/users"),
+        api("/api/products"),
+        api("/api/orders"),
+      ]);
+
+      const userSelect = document.querySelector("#user");
+      userSelect.replaceChildren(...users.map((user) => {
+        const option = document.createElement("option");
+        option.value = user.id;
+        option.textContent = user.name;
+        return option;
+      }));
+
+      const productSelect = document.querySelector("#product");
+      productSelect.replaceChildren(...products.map((product) => {
+        const option = document.createElement("option");
+        option.value = product.id;
+        option.textContent = `${product.name} (${product.stock} en stock)`;
+        option.disabled = product.stock === 0;
+        return option;
+      }));
+
+      const productsList = document.querySelector("#products");
+      productsList.replaceChildren(...products.map((product) => {
+        const item = document.createElement("li");
+        item.textContent = `${product.name} — ${product.stock} en stock`;
+        return item;
+      }));
+
+      const ordersList = document.querySelector("#orders");
+      ordersList.replaceChildren(...orders.map((order) => {
+        const card = document.createElement("article");
+        const heading = document.createElement("h3");
+        heading.textContent = `Commande #${order.id}`;
+        const details = document.createElement("p");
+        details.textContent = `${order.quantity} × ${products.find((product) => product.id === order.productId)?.name || "Produit"} — ${statusLabels[order.status]}`;
+        const actions = document.createElement("div");
+        actions.className = "actions";
+
+        const trackLink = document.createElement("a");
+        trackLink.href = `/?order=${order.id}`;
+        trackLink.textContent = "Suivre";
+        actions.append(trackLink);
+
+        if (order.status === "preparing") {
+          const advanceButton = document.createElement("button");
+          advanceButton.textContent = "Expédier";
+          advanceButton.addEventListener("click", async () => {
+            try {
+              await api(`/api/orders/${order.id}/advance`, { method: "PATCH" });
+              await loadShop();
+            } catch (error) {
+              showError(error);
+            }
+          });
+          const cancelButton = document.createElement("button");
+          cancelButton.textContent = "Annuler";
+          cancelButton.addEventListener("click", async () => {
+            try {
+              await api(`/api/orders/${order.id}/cancel`, { method: "PATCH" });
+              await loadShop();
+            } catch (error) {
+              showError(error);
+            }
+          });
+          actions.append(advanceButton, cancelButton);
+        }
+
+        card.append(heading, details, actions);
+        return card;
+      }));
+    }
+
+    async function startTracking(orderId) {
+      document.querySelector("#shop").hidden = true;
+      document.querySelector("#tracking").hidden = false;
+      document.querySelector("#order-id").textContent = `#${orderId}`;
+
+      try {
+        const order = await api(`/api/orders/${orderId}`);
+        const statusElement = document.querySelector("#order-status");
+        const renderOrder = (updated) => {
+          statusElement.textContent = statusLabels[updated.status] || updated.status;
+        };
+        renderOrder(order);
+
+        const source = new EventSource(`/api/orders/${orderId}/events`);
+        for (const name of ["order-state", "order-created", "order-status", "order-cancelled"]) {
+          source.addEventListener(name, (event) => renderOrder(JSON.parse(event.data)));
+        }
+        source.addEventListener("stream-error", (event) => {
+          const data = JSON.parse(event.data);
+          document.querySelector("#tracking-error").textContent = data.error;
+          source.close();
+        });
+        source.onerror = () => {
+          document.querySelector("#tracking-error").textContent = "Connexion interrompue, reconnexion automatique…";
+        };
+      } catch (error) {
+        document.querySelector("#tracking-error").textContent = error.message;
+      }
+    }
+
+    document.querySelector("#create-order").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const body = {
+        userId: Number(document.querySelector("#user").value),
+        productId: Number(document.querySelector("#product").value),
+        quantity: Number(document.querySelector("#quantity").value),
+      };
+      try {
+        const order = await api("/api/orders", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        window.location.href = `/?order=${order.id}`;
+      } catch (error) {
+        showError(error);
+      }
+    });
+
+    const orderId = new URLSearchParams(window.location.search).get("order");
+    if (orderId && /^\d+$/.test(orderId)) {
+      void startTracking(orderId);
+    } else {
+      void loadShop().catch(showError);
+    }
+  </script>
 </body>
 </html>
